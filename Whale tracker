@@ -1,0 +1,225 @@
+{
+  "name": "whalewatch-glitch",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.4.0"
+  }
+}
+// server.js -- Node + Express scanner for Solana wallet buys (basic MVP)
+import express from "express";
+import fetch from "node-fetch";
+
+const app = express();
+app.use(express.static("public"));
+app.use(express.json());
+
+/*
+  CONFIG: Edit these values below in this file after you paste.
+  - WATCH_WALLETS: add wallet pubkeys to monitor
+  - THRESHOLD_SOL: minimum SOL to flag
+  - POLL_INTERVAL_MS: how often to poll (ms)
+*/
+const WATCH_WALLETS = [
+  "8rvAsDKeAcEjEikZMu9k8v1y8mW6gQQiMobd89Uy7qR"
+];
+const SOLSCAN_BASE = "https://public-api.solscan.io";
+const THRESHOLD_SOL = 10; // flag buys >= 10 SOL
+const POLL_INTERVAL_MS = 30_000; // 30s
+
+let store = {
+  suggested: {},   // mint -> info
+  whales: [],      // recent whale buys
+  seen: new Set()
+};
+
+async function getAccountTxs(wallet, limit = 20){
+  try {
+    const url = `${SOLSCAN_BASE}/account/transactions?address=${wallet}&limit=${limit}`;
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const j = await r.json();
+    return j.data || [];
+  } catch (e) {
+    console.log("getAccountTxs err", e);
+    return [];
+  }
+}
+
+async function getTxDetail(sig){
+  try {
+    const url = `${SOLSCAN_BASE}/transaction/${sig}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    console.log("getTxDetail err", e);
+    return null;
+  }
+}
+
+function parseSolFromParsed(parsedIns){
+  // heuristic: scan parsed instructions for lamports/amount fields
+  try {
+    for (const ins of (parsedIns || [])) {
+      const info = ins.info || ins.parsed?.info || {};
+      const lam = info.lamports || info.lamport || info.amount || info.lamportAmount;
+      if (lam) return Number(lam) / 1e9;
+    }
+  } catch(e){}
+  return 0;
+}
+
+function findTokenIncrease(meta, wallet){
+  const pre = meta.preTokenBalances || [];
+  const post = meta.postTokenBalances || [];
+  // map by accountIndex+mint
+  const preMap = {};
+  for (const p of pre) preMap[`${p.accountIndex}|${p.mint}`] = p;
+  for (const q of post) {
+    const key = `${q.accountIndex}|${q.mint}`;
+    const p = preMap[key];
+    const postAmt = Number(q.uiTokenAmount.uiAmount || q.uiTokenAmount.amount || 0);
+    const preAmt = p ? Number(p.uiTokenAmount.uiAmount || p.uiTokenAmount.amount || 0) : 0;
+    if (postAmt > preAmt && q.owner === wallet) {
+      return { mint: q.mint, delta: postAmt - preAmt };
+    }
+  }
+  return null;
+}
+
+async function scanCycle(){
+  try {
+    for (const w of WATCH_WALLETS) {
+      const txs = await getAccountTxs(w, 30);
+      for (const t of txs) {
+        const sig = t.txHash || t.signature;
+        if (!sig || store.seen.has(sig)) continue;
+        const detail = await getTxDetail(sig);
+        store.seen.add(sig);
+        if (!detail) continue;
+        // look for token increases involving wallet
+        const buy = findTokenIncrease(detail, w);
+        if (!buy) continue;
+        // estimate SOL value heuristically
+        const parsed = detail.parsedInstructions || detail.instructions || [];
+        const solVal = parseSolFromParsed(parsed) || 0;
+        if (solVal >= THRESHOLD_SOL) {
+          const entry = {
+            sig,
+            wallet: w,
+            mint: buy.mint,
+            delta: buy.delta,
+            sol_value: solVal,
+            time: detail.blockTime || Date.now()/1000,
+            link: `https://solscan.io/tx/${sig}`
+          };
+          store.whales.unshift(entry);
+          if (store.whales.length > 200) store.whales.length = 200;
+          // suggested tokens
+          if (!store.suggested[buy.mint]) store.suggested[buy.mint] = { mint: buy.mint, reason: `Large buy ~${solVal} SOL`, buys: [] };
+          store.suggested[buy.mint].buys = store.suggested[buy.mint].buys || [];
+          store.suggested[buy.mint].buys.unshift(entry);
+          console.log("Whale buy recorded:", entry);
+        }
+      }
+    }
+  } catch (e) {
+    console.log("scanCycle error", e);
+  }
+}
+
+setInterval(scanCycle, POLL_INTERVAL_MS);
+scanCycle(); // immediately start
+
+// API endpoints
+app.get("/api/suggested", (req, res) => {
+  const arr = Object.values(store.suggested).sort((a,b)=> (b.buys?.[0]?.time||0) - (a.buys?.[0]?.time||0));
+  res.json(arr);
+});
+app.get("/api/whales", (req, res) => res.json(store.whales));
+app.post("/api/add_wallet", (req, res) => {
+  const w = req.body.wallet;
+  if (w && !WATCH_WALLETS.includes(w)) WATCH_WALLETS.push(w);
+  res.json({ok:true, watching: WATCH_WALLETS});
+});
+
+const listener = app.listen(process.env.PORT || 3000, () => {
+  console.log("App running on port", listener.address().port);
+});
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WhaleWatch — Glitch</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="container">
+    <h1>WhaleWatch</h1>
+    <div class="cols">
+      <div>
+        <h2>Suggested Tokens</h2>
+        <div id="suggested">Loading...</div>
+      </div>
+      <div>
+        <h2>Recent Whale Buys</h2>
+        <div id="whales">Loading...</div>
+      </div>
+    </div>
+    <div class="add">
+      <input id="wallet" placeholder="Paste wallet to watch">
+      <button id="add">Add</button>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
+async function fetchSuggested(){
+  const r = await fetch('/api/suggested'); const data = await r.json();
+  const el = document.getElementById('suggested');
+  if (!data.length) { el.innerHTML = '<p>No suggestions yet.</p>'; return; }
+  el.innerHTML = data.map(t => `
+    <div class="token">
+      <div><b>${t.mint.slice(0,8)}...</b> <small>${t.reason}</small></div>
+      <div><a href="/token.html?mint=${encodeURIComponent(t.mint)}" target="_blank">Details</a>
+      <button onclick="copy('${t.mint}')">Copy CA</button></div>
+    </div>
+  `).join('');
+}
+
+async function fetchWhales(){
+  const r = await fetch('/api/whales'); const data = await r.json();
+  const el = document.getElementById('whales');
+  if (!data.length) { el.innerHTML = '<p>No whale buys yet.</p>'; return; }
+  el.innerHTML = data.map(w => `
+    <div class="whale">
+      <a href="${w.link}" target="_blank">${w.sig.slice(0,8)}...</a>
+      <div>mint: ${w.mint.slice(0,8)}... | sol: ${w.sol_value}</div>
+    </div>
+  `).join('');
+}
+
+function copy(text){ navigator.clipboard.writeText(text); }
+
+document.getElementById('add').onclick = async () => {
+  const w = document.getElementById('wallet').value.trim();
+  if (!w) return alert('Paste wallet');
+  await fetch('/api/add_wallet', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({wallet:w})});
+  document.getElementById('wallet').value='';
+  alert('Added — scanner will pick up soon.');
+};
+
+setInterval(fetchSuggested, 5000);
+setInterval(fetchWhales, 5000);
+fetchSuggested(); fetchWhales();
+body{font-family:arial;background:#0b1220;color:#e6eef8;padding:16px}
+.container{max-width:1000px;margin:0 auto}
+.cols{display:flex;gap:16px}
+.token, .whale{background:#081226;padding:8px;border-radius:6px;margin-bottom:6px}
+input{padding:8px;border-radius:6px;border:1px solid #233546;background:#071826;color:#e6eef8}
+button{padding:8px;border-radius:6px;background:#0ea5a4;border:0;color:#012;cursor:pointer}
